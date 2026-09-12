@@ -47,6 +47,32 @@ oracledb = { version = "26.0.0-beta.3", features = ["arrow"] }
 
 The documentation can be found [here](https://docs.rs/oracledb).
 
+## Query cancellation
+
+This driver exposes a first-pass cancellation API for plain TCP connections only.
+The API is intentionally limited to Unix/macOS/Linux TCP connections and is
+not available for TCPS/TLS or Windows at this stage.
+
+```rust,no_run
+use oracledb::Connection;
+
+fn main() -> Result<(), oracledb::Error> {
+    let conn = oracledb::connect(
+        oracledb::Config::default()
+            .set_credentials("user", "password")
+            .set_connect_string("server:1521/service_name")?,
+    )?;
+
+    let cancel = conn.cancel_handle()?;
+    // start a worker thread that runs the query
+    // cancel.cancel()?;
+    Ok(())
+}
+```
+
+The cancel request should be treated as a transport-level interrupt. The
+actual SQL execution returns a cancellation-related error once Oracle responds.
+
 ## Examples
 
 Execute queries and return rows.

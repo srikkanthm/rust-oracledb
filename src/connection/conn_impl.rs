@@ -30,6 +30,8 @@
 // and for pooling connections.
 //-----------------------------------------------------------------------------
 
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -54,6 +56,8 @@ use crate::statement::Statement;
 
 pub(crate) struct ConnImpl {
     client_ref: ClientRef,
+    cancel_stream: Arc<Mutex<Option<TcpStream>>>,
+    cancel_full_packet_size: bool,
     db_info: DbInfo,
     returned_to_pool: Instant,
 }
@@ -98,9 +102,13 @@ impl ConnImpl {
         config.validate()?;
         let mut client = Client::new(config, pool_id);
         let db_info = client.connect()?;
+        let (cancel_stream, cancel_full_packet_size) =
+            client.cancel_stream()?;
         let client_ref = std::sync::Arc::new(std::sync::Mutex::new(client));
         Ok(ConnImpl {
             client_ref,
+            cancel_stream: Arc::new(Mutex::new(cancel_stream)),
+            cancel_full_packet_size,
             db_info,
             returned_to_pool: Instant::now(),
         })
@@ -112,6 +120,18 @@ impl ConnImpl {
         db_type: &'static DbType,
     ) -> Result<Lob, Error> {
         Lob::create_temp(self.client_ref.clone(), db_type)
+    }
+
+    /// Returns a handle that can trigger a cancellation interrupt on the
+    /// underlying transport without waiting on the query mutex.
+    pub(crate) fn cancel_handle(
+        &self,
+    ) -> Result<crate::connection::CancelHandle, Error> {
+        let stream = self.cancel_stream.clone();
+        crate::connection::CancelHandle::new(
+            stream,
+            self.cancel_full_packet_size,
+        )
     }
 
     /// Returns the current status of the connection.

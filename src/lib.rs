@@ -71,6 +71,7 @@ mod write_buffer;
 // public structs
 pub use crate::config::Config;
 pub use crate::config::PoolConfig;
+pub use crate::connection::CancelHandle;
 pub use crate::connection::Connection;
 pub use crate::cursor::Cursor;
 pub use crate::db_type::DbType;

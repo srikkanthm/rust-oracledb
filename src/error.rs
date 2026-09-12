@@ -42,6 +42,7 @@ use crate::response::ResponseLocation;
 pub enum ErrorKind {
     ArrowOperation,
     CallTimeoutExceeded,
+    Cancelled,
     ColumnTruncated(usize, usize),
     DbError(String),
     DeadConnection,
@@ -185,6 +186,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::CallTimeoutExceeded => {
                 fmt.write_str("the configured call timeout was exceeded")?
+            }
+            ErrorKind::Cancelled => {
+                fmt.write_str("the database operation was cancelled")?
             }
             ErrorKind::ColumnTruncated(col_value_size, actual_size) => write!(
                 fmt,
@@ -701,6 +705,20 @@ impl Error {
 
     pub(crate) fn unable_to_recover() -> Error {
         Error::new(ErrorKind::UnableToRecover, None)
+    }
+
+    pub fn cancelled() -> Error {
+        Error::new(ErrorKind::Cancelled, None)
+    }
+
+    pub fn cancel_not_supported() -> Error {
+        Error::new(
+            ErrorKind::NotImplemented(
+                "query cancellation is only supported for plain TCP connections"
+                    .to_string(),
+            ),
+            None,
+        )
     }
 
     pub(crate) fn unexpected_error(

@@ -708,6 +708,14 @@ impl Client {
         Ok(())
     }
 
+    /// Returns a cancellation-capable clone of the underlying plain TCP
+    /// socket when available.
+    pub(crate) fn cancel_stream(
+        &self,
+    ) -> Result<(Option<TcpStream>, bool), Error> {
+        self.transport.cancel_stream()
+    }
+
     /// Returns the call timeout set on the connection or an error if the
     /// connection is not currently established.
     pub(crate) fn get_call_timeout(

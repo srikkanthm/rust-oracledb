@@ -33,8 +33,13 @@ mod conn_impl;
 pub(crate) use conn_impl::ConnImpl;
 pub(crate) use conn_impl::ConnImplStatus;
 
+use std::io::Write;
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+
 use crate::bind_params::BindParameters;
 use crate::config::Config;
+use crate::constants;
 use crate::cursor::Cursor;
 use crate::db_type::DbType;
 use crate::db_value::ToDbValue;
@@ -47,6 +52,57 @@ use crate::ora_version::OracleVersion;
 use crate::pool::PoolContentsRef;
 use crate::row::Row;
 use crate::statement::Statement;
+
+/// A cancellation handle associated with a plain TCP connection. It uses an
+/// independent socket clone so cancellation can be requested without locking the
+/// same client mutex used by an active query.
+pub struct CancelHandle {
+    stream: Arc<Mutex<Option<TcpStream>>>,
+    full_packet_size: bool,
+}
+
+impl CancelHandle {
+    fn new(
+        stream: Arc<Mutex<Option<TcpStream>>>,
+        full_packet_size: bool,
+    ) -> Result<Self, Error> {
+        if stream.lock().unwrap().is_none() {
+            return Err(Error::cancel_not_supported());
+        }
+        Ok(Self {
+            stream,
+            full_packet_size,
+        })
+    }
+
+    /// Triggers an Oracle interrupt on the underlying connection.
+    ///
+    /// The call itself succeeds when the cancellation request is accepted; the
+    /// actual SQL operation returns a cancellation-related error once the Oracle
+    /// server responds to the interrupt.
+    pub fn cancel(&self) -> Result<(), Error> {
+        let mut guard = self.stream.lock().unwrap();
+        let stream = guard.as_mut().ok_or_else(Error::cancel_not_supported)?;
+
+        let marker = [1u8, 0u8, constants::MARKER_TYPE_INTERRUPT];
+        let packet_size: usize = 11;
+        let mut packet = Vec::with_capacity(packet_size);
+        if self.full_packet_size {
+            packet.extend_from_slice(&(packet_size as u32).to_be_bytes());
+        } else {
+            packet.extend_from_slice(&(packet_size as u16).to_be_bytes());
+            packet.push(0);
+            packet.push(0);
+        }
+        packet.push(constants::PACKET_TYPE_MARKER);
+        packet.push(0);
+        packet.extend_from_slice(&[0, 0]);
+        packet.extend_from_slice(&marker);
+        stream.write_all(&packet)?;
+        stream.flush()?;
+        Ok(())
+    }
+}
 
 /// Represents a connection to the database. This can be either a standalone
 /// connection created by calling [connect()](`crate::connect`) or a pooled
@@ -99,6 +155,16 @@ impl Connection {
             conn_impl: Some(conn_impl),
             pool_contents_ref: Some(pool_contents_ref.clone()),
         }
+    }
+
+    /// Returns a handle that can interrupt an in-flight operation.
+    pub fn cancel_handle(&self) -> Result<CancelHandle, Error> {
+        self.get_impl()?.cancel_handle()
+    }
+
+    /// Cancels the in-flight operation on this connection.
+    pub fn cancel(&self) -> Result<(), Error> {
+        self.cancel_handle()?.cancel()
     }
 
     /// Returns the "call timeout" value currently in effect by the connection
@@ -351,5 +417,17 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancelHandle;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn cancel_handle_requires_plain_tcp() {
+        let handle = CancelHandle::new(Arc::new(Mutex::new(None)), false);
+        assert!(handle.is_err());
     }
 }

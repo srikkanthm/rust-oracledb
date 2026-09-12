@@ -252,6 +252,18 @@ impl Transport {
         Ok(())
     }
 
+    /// Returns a clone of the underlying plain TCP socket that can be used
+    /// for cancellation, if the transport is not using TLS.
+    pub(crate) fn cancel_stream(
+        &self,
+    ) -> Result<(Option<TcpStream>, bool), Error> {
+        if self.tls_stream.is_some() {
+            return Ok((None, self.full_packet_size));
+        }
+        let stream = self.stream.as_ref().ok_or_else(Error::not_connected)?;
+        Ok((Some(stream.try_clone()?), self.full_packet_size))
+    }
+
     /// Returns the read timeout associated with the transport.
     pub(crate) fn get_read_timeout(
         &self,
