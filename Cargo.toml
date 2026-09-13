@@ -53,6 +53,11 @@ uuid = { version = "1.24.0", features = ["v4"] }
 webpki-roots = "1.0.8"
 whoami = "2.1.2"
 
+# Out-of-band (TCP urgent) break for on-demand query cancellation. Only
+# meaningful on Unix; Windows has no usable MSG_OOB equivalent.
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
+
 [dev-dependencies]
 rstest = "0.26.1"
 

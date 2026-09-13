@@ -150,6 +150,7 @@ pub const PROTOCOL_VERSION_23: u16 = 319;
 
 // database error constants
 pub const DB_ERR_NUM_NO_DATA_FOUND: usize = 1403;
+pub const DB_ERR_NUM_USER_REQUESTED_CANCEL: usize = 1013;
 pub const DB_ERR_NUM_INVALID_SERVICE_NAME: usize = 12514;
 pub const DB_ERR_NUM_INVALID_SID: usize = 12505;
 pub const DB_ERR_NUM_SESSION_SHUTDOWN: usize = 12572;

@@ -59,6 +59,10 @@ use crate::statement::Statement;
 pub struct CancelHandle {
     stream: Arc<Mutex<Option<TcpStream>>>,
     full_packet_size: bool,
+    /// Whether the out-of-band (TCP urgent) break path is available. OOB is
+    /// what actually interrupts a server that is busy executing a statement;
+    /// it is currently only implemented for Unix sockets.
+    oob_supported: bool,
 }
 
 impl CancelHandle {
@@ -72,18 +76,41 @@ impl CancelHandle {
         Ok(Self {
             stream,
             full_packet_size,
+            oob_supported: cfg!(unix),
         })
     }
 
     /// Triggers an Oracle interrupt on the underlying connection.
     ///
-    /// The call itself succeeds when the cancellation request is accepted; the
-    /// actual SQL operation returns a cancellation-related error once the Oracle
-    /// server responds to the interrupt.
+    /// On Unix a TCP out-of-band (urgent) break is sent first, because an
+    /// in-band marker is only noticed once the server returns to reading (i.e.
+    /// it cannot interrupt a statement that is still executing). Elsewhere the
+    /// in-band marker is used as a best-effort fallback.
+    ///
+    /// The call itself succeeds once the request is sent; the in-flight SQL
+    /// operation then returns a cancellation error when the server responds.
     pub fn cancel(&self) -> Result<(), Error> {
         let mut guard = self.stream.lock().unwrap();
         let stream = guard.as_mut().ok_or_else(Error::cancel_not_supported)?;
 
+        if self.oob_supported {
+            #[cfg(unix)]
+            {
+                return send_oob_break(stream);
+            }
+            #[cfg(not(unix))]
+            {
+                // No OOB implementation off Unix; fall through to the marker.
+            }
+        }
+
+        self.send_marker(stream)
+    }
+
+    /// Sends the in-band Oracle marker interrupt packet, matching the framing
+    /// used by the transport for a marker message. This is the fallback when an
+    /// out-of-band break is not available.
+    fn send_marker(&self, stream: &mut TcpStream) -> Result<(), Error> {
         let marker = [1u8, 0u8, constants::MARKER_TYPE_INTERRUPT];
         let packet_size: usize = 11;
         let mut packet = Vec::with_capacity(packet_size);
@@ -102,6 +129,17 @@ impl CancelHandle {
         stream.flush()?;
         Ok(())
     }
+}
+
+/// Sends a TCP urgent (out-of-band) byte on the connection. Oracle treats this
+/// as an OCI-style break and aborts the statement currently executing, even
+/// while the server is busy (which an in-band marker cannot do).
+#[cfg(unix)]
+fn send_oob_break(stream: &TcpStream) -> Result<(), Error> {
+    socket2::SockRef::from(stream)
+        .send_out_of_band(b"!")
+        .map_err(|e| Error::unexpected_error(Box::new(e)))?;
+    Ok(())
 }
 
 /// Represents a connection to the database. This can be either a standalone

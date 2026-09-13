@@ -123,6 +123,12 @@ impl Response {
 
     pub(crate) fn check_for_error(&mut self) -> Result<(), Error> {
         if let Some(error_info) = self.error_info.as_ref() {
+            // ORA-01013 ("user requested cancel of current operation") is how
+            // the server reports an interrupt/break, so surface it as the
+            // dedicated Cancelled kind instead of a generic database error.
+            if error_info.num == constants::DB_ERR_NUM_USER_REQUESTED_CANCEL {
+                return Err(Error::cancelled());
+            }
             let message = error_info.error_message();
             if !message.is_empty() {
                 return Err(Error::db_error(message.to_string()));
