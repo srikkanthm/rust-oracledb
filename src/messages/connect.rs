@@ -41,6 +41,10 @@ use crate::write_buffer::WriteBuffer;
 
 // Global Service Options
 const GSO_DONT_CARE: u16 = 0x0001;
+const GSO_CAN_RECV_ATTENTION: u16 = 0x0400;
+
+// Connect flags (second set)
+const TNS_CHECK_OOB: u32 = 0x01;
 
 // NSI constants
 const NSI_DISABLE_NA: u8 = 0x04;
@@ -58,6 +62,7 @@ pub struct ConnectMessage<'a> {
     pub packet_flags: u8,
     pub sdu: u32,
     pub protocol_version: u16,
+    pub protocol_options: u16,
     pub protocol_flags: u32,
     pub accepted: bool,
     pub tls_renegotiation_needed: bool,
@@ -78,6 +83,7 @@ impl ConnectMessage<'_> {
             packet_flags: 0,
             sdu: description.sdu(),
             protocol_version: 0,
+            protocol_options: 0,
             protocol_flags: 0,
             accepted: false,
             tls_renegotiation_needed: false,
@@ -94,7 +100,8 @@ impl ConnectMessage<'_> {
         if self.protocol_version < constants::PROTOCOL_VERSION_12 {
             return Err(Error::server_version_not_supported());
         }
-        resp.advance(12)?;
+        self.protocol_options = resp.read_u16be()?;
+        resp.advance(10)?;
         let flags1: u8 = resp.read_u8()?;
         if flags1 & NSI_NA_REQUIRED != 0 {
             todo!();
@@ -216,9 +223,19 @@ impl Message for ConnectMessage<'_> {
             }
         };
         let nsi_flags = NSI_SUPPORT_SECURITY_RENEG | NSI_DISABLE_NA;
+        // Advertise that this client can receive out-of-band "attention"
+        // (the TCP urgent break used to cancel a running statement). Without
+        // this the server ignores the break. OOB is Unix-only.
+        let supports_oob = cfg!(unix);
+        let service_options = if supports_oob {
+            GSO_DONT_CARE | GSO_CAN_RECV_ATTENTION
+        } else {
+            GSO_DONT_CARE
+        };
+        let connect_flags_2 = if supports_oob { TNS_CHECK_OOB } else { 0 };
         buf.write_u16be(constants::PROTOCOL_VERSION_23);
         buf.write_u16be(constants::PROTOCOL_VERSION_MIN);
-        buf.write_u16be(GSO_DONT_CARE);
+        buf.write_u16be(service_options);
         buf.write_u16be(short_sdu);
         buf.write_u16be(short_sdu);
         buf.write_u16be(PROTOCOL_CHARACTERISTICS);
@@ -235,7 +252,7 @@ impl Message for ConnectMessage<'_> {
         buf.write_u32be(self.sdu);
         buf.write_u32be(self.sdu);
         buf.write_u32be(0); // connect flags 1
-        buf.write_u32be(0); // connect flags 1
+        buf.write_u32be(connect_flags_2); // connect flags 2
         if !self.extended_data_needed() {
             self.serialize_extended_data(client, buf);
         }

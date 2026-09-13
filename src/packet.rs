@@ -53,16 +53,6 @@ impl Packet {
         }
     }
 
-    /// Returns a boolean indicating if the packet refers to a marker packet
-    /// containing a reset marker type.
-    pub(crate) fn has_reset_marker(&self) -> bool {
-        if self.packet_type == constants::PACKET_TYPE_MARKER {
-            self.buf[2] == constants::MARKER_TYPE_RESET
-        } else {
-            false
-        }
-    }
-
     /// Returns the size of the header. Data packets are 10 bytes (because they
     /// include the data flags, unlike other packets).
     pub(crate) fn header_size(&self) -> usize {

@@ -58,6 +58,7 @@ pub(crate) struct ConnImpl {
     client_ref: ClientRef,
     cancel_stream: Arc<Mutex<Option<TcpStream>>>,
     cancel_full_packet_size: bool,
+    cancel_supports_oob: bool,
     db_info: DbInfo,
     returned_to_pool: Instant,
 }
@@ -104,11 +105,13 @@ impl ConnImpl {
         let db_info = client.connect()?;
         let (cancel_stream, cancel_full_packet_size) =
             client.cancel_stream()?;
+        let cancel_supports_oob = client.supports_oob();
         let client_ref = std::sync::Arc::new(std::sync::Mutex::new(client));
         Ok(ConnImpl {
             client_ref,
             cancel_stream: Arc::new(Mutex::new(cancel_stream)),
             cancel_full_packet_size,
+            cancel_supports_oob,
             db_info,
             returned_to_pool: Instant::now(),
         })
@@ -131,7 +134,13 @@ impl ConnImpl {
         crate::connection::CancelHandle::new(
             stream,
             self.cancel_full_packet_size,
+            self.cancel_supports_oob,
         )
+    }
+
+    /// Returns whether the server accepts out-of-band (TCP urgent) breaks.
+    pub(crate) fn supports_oob(&self) -> bool {
+        self.cancel_supports_oob
     }
 
     /// Returns the current status of the connection.

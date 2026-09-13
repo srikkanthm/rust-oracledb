@@ -225,12 +225,16 @@ impl Client {
     /// these are also accommodated.
     fn reset(&mut self) -> Result<Packet, Error> {
         self.send_marker(constants::MARKER_TYPE_RESET)?;
-        let mut reset_received = false;
+        // Discard any marker packets and return the first real (data) packet.
+        //
+        // The server may have already sent its reset marker before we sent
+        // ours (the caller consumes that marker and then calls this), so
+        // waiting for another reset marker here would block forever. Markers
+        // are acknowledgements only; the operation's result/error always
+        // arrives as a data packet.
         loop {
             let packet = self.transport.receive_packet()?;
-            if packet.has_reset_marker() {
-                reset_received = true;
-            } else if reset_received {
+            if packet.packet_type != constants::PACKET_TYPE_MARKER {
                 return Ok(packet);
             }
         }
@@ -655,6 +659,7 @@ impl Client {
         }
         self.caps.adjust_for_protocol(
             connect_message.protocol_version,
+            connect_message.protocol_options,
             connect_message.protocol_flags,
         );
         self.transport.set_full_packet_size();
@@ -926,6 +931,11 @@ impl Client {
     /// Returns whether the database supports the "end of response" flag.
     pub(crate) fn supports_end_of_response(&self) -> bool {
         self.caps.supports_end_of_response()
+    }
+
+    /// Returns whether the server accepts out-of-band (TCP urgent) breaks.
+    pub(crate) fn supports_oob(&self) -> bool {
+        self.caps.supports_oob()
     }
 
     /// Returns whether the client supports a particular TTC field version.

@@ -119,6 +119,9 @@ const RCAP_VAL_TTC_SESSION_STATE_OPS: u8 = 0x10;
 const ACCEPT_FLAG_FAST_AUTH: u32 = 0x10000000;
 const ACCEPT_FLAG_HAS_END_OF_RESPONSE: u32 = 0x02000000;
 
+// general service options (connect / accept protocol options)
+const GSO_CAN_RECV_ATTENTION: u16 = 0x0400;
+
 pub struct Capabilities {
     protocol_version: u16,
     ttc_field_version: u8,
@@ -131,11 +134,22 @@ pub struct Capabilities {
     supports_request_boundaries: bool,
     supports_end_user_security_context: bool,
     supports_ha_readiness: bool,
+    supports_oob: bool,
 }
 
 impl Capabilities {
-    pub fn adjust_for_protocol(&mut self, protocol_version: u16, flags: u32) {
+    pub fn adjust_for_protocol(
+        &mut self,
+        protocol_version: u16,
+        protocol_options: u16,
+        flags: u32,
+    ) {
         self.protocol_version = protocol_version;
+        // On non-Windows the client offered attention; the server confirms it
+        // can receive out-of-band breaks by echoing GSO_CAN_RECV_ATTENTION.
+        if cfg!(unix) {
+            self.supports_oob = protocol_options & GSO_CAN_RECV_ATTENTION != 0;
+        }
         if flags & ACCEPT_FLAG_FAST_AUTH != 0 {
             self.supports_fast_auth = true;
         }
@@ -262,6 +276,7 @@ impl Capabilities {
             supports_request_boundaries: false,
             supports_end_user_security_context: false,
             supports_ha_readiness: false,
+            supports_oob: false,
         };
         caps.init_compile_caps();
         caps.init_runtime_caps();
@@ -286,6 +301,11 @@ impl Capabilities {
     /// piggybacking.
     pub fn supports_end_user_security_context(&self) -> bool {
         self.supports_end_user_security_context
+    }
+
+    /// Returns whether the server accepts out-of-band (TCP urgent) breaks.
+    pub fn supports_oob(&self) -> bool {
+        self.supports_oob
     }
 
     pub fn supports_fast_auth(&self) -> bool {

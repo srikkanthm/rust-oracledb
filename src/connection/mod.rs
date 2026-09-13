@@ -69,6 +69,7 @@ impl CancelHandle {
     fn new(
         stream: Arc<Mutex<Option<TcpStream>>>,
         full_packet_size: bool,
+        oob_supported: bool,
     ) -> Result<Self, Error> {
         if stream.lock().unwrap().is_none() {
             return Err(Error::cancel_not_supported());
@@ -76,7 +77,7 @@ impl CancelHandle {
         Ok(Self {
             stream,
             full_packet_size,
-            oob_supported: cfg!(unix),
+            oob_supported,
         })
     }
 
@@ -203,6 +204,12 @@ impl Connection {
     /// Cancels the in-flight operation on this connection.
     pub fn cancel(&self) -> Result<(), Error> {
         self.cancel_handle()?.cancel()
+    }
+
+    /// Returns whether this connection supports out-of-band query cancellation
+    /// (a TCP urgent break). False for TLS and non-Unix platforms.
+    pub fn supports_oob(&self) -> bool {
+        self.get_impl().map(|i| i.supports_oob()).unwrap_or(false)
     }
 
     /// Returns the "call timeout" value currently in effect by the connection
@@ -465,7 +472,8 @@ mod tests {
 
     #[test]
     fn cancel_handle_requires_plain_tcp() {
-        let handle = CancelHandle::new(Arc::new(Mutex::new(None)), false);
+        let handle =
+            CancelHandle::new(Arc::new(Mutex::new(None)), false, false);
         assert!(handle.is_err());
     }
 }
