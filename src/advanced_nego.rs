@@ -10,6 +10,7 @@
 // -----------------------------------------------------------------------------
 
 use rand::RngExt;
+use std::time::Duration;
 
 use crate::constants;
 use crate::encryption::{
@@ -18,6 +19,26 @@ use crate::encryption::{
 };
 use crate::error::Error;
 use crate::transport::Transport;
+
+/// Where the ANO handshake trace is written so it can be shared for debugging.
+fn ano_log_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    home.join("sqlhighland-ano-debug.log")
+}
+
+/// Compact hex dump for the trace.
+fn hex_dump(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for byte in bytes.iter().take(256) {
+        out.push_str(&format!("{byte:02x} "));
+    }
+    if bytes.len() > 256 {
+        out.push_str("...");
+    }
+    out
+}
 
 const ANO_MAGIC: u32 = 0xDEAD_BEEF;
 const ANO_VERSION: u32 = 0x0B20_0200;
@@ -323,9 +344,25 @@ fn send_ano_data(transport: &mut Transport, data: &[u8]) -> Result<(), Error> {
     transport.send_packets(constants::PACKET_TYPE_DATA, 0, 0, data)
 }
 
-fn receive_ano_data(transport: &mut Transport) -> Result<Vec<u8>, Error> {
+fn receive_ano_data(
+    transport: &mut Transport,
+    trace: &mut String,
+) -> Result<Vec<u8>, Error> {
     loop {
-        let packet = transport.receive_packet()?;
+        let packet = match transport.receive_packet() {
+            Ok(packet) => packet,
+            Err(e) => {
+                trace.push_str(&format!("recv error: {e}\n"));
+                return Err(e);
+            }
+        };
+        trace.push_str(&format!(
+            "recv type={} flags={} len={} hex={}\n",
+            packet.packet_type,
+            packet.packet_flags,
+            packet.buf.len(),
+            hex_dump(&packet.buf)
+        ));
         match packet.packet_type {
             constants::PACKET_TYPE_DATA => return Ok(packet.buf),
             // Control packets (in-band notifications) are not part of the ANO
@@ -370,8 +407,38 @@ pub(crate) struct AnoSession {
 pub(crate) fn negotiate(
     transport: &mut Transport,
 ) -> Result<AnoSession, Error> {
-    send_ano_data(transport, &build_client_request())?;
-    let response = receive_ano_data(transport)?;
+    // Bound the handshake so a misbehaving server cannot hang the app, and
+    // record a trace for debugging.
+    let _ = transport.set_read_timeout(Some(Duration::from_secs(20)));
+    let mut trace = String::new();
+    let result = negotiate_inner(transport, &mut trace);
+    let _ = transport.set_read_timeout(None);
+    if let Err(e) = &result {
+        trace.push_str(&format!("error: {e}\n"));
+    }
+    let _ = std::fs::write(ano_log_path(), &trace);
+    match result {
+        Ok(session) => Ok(session),
+        Err(e) => Err(ano_err(&format!(
+            "{e} (handshake trace written to {})",
+            ano_log_path().display()
+        ))),
+    }
+}
+
+fn negotiate_inner(
+    transport: &mut Transport,
+    trace: &mut String,
+) -> Result<AnoSession, Error> {
+    let request = build_client_request();
+    trace.push_str(&format!(
+        "send len={} hex={}\n",
+        request.len(),
+        hex_dump(&request)
+    ));
+    send_ano_data(transport, &request)?;
+    let response = receive_ano_data(transport, trace)?;
+    trace.push_str(&format!("recv ANO response len={}\n", response.len()));
     let info = parse_server_response(&response)?;
 
     let Some(dh) = info.dh else {
