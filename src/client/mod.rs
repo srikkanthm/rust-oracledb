@@ -722,16 +722,12 @@ impl Client {
     /// Performs the second phase of connecting to the database. Any errors
     /// that take place during this phase are returned directly to the caller.
     pub(crate) fn connect_phase_two(&mut self) -> Result<DbInfo, Error> {
-        // Fast authentication is not exercised by our test servers; default to
-        // the well-tested O5LOGON path (set ORACLE_FORCE_FAST_AUTH=1 to opt in).
-        let use_fast_auth = self.caps.supports_fast_auth()
-            && std::env::var_os("ORACLE_FORCE_FAST_AUTH").is_some();
         crate::advanced_nego::ano_trace(&format!(
-            "auth path: server_fast_auth={} using_fast={}",
-            self.caps.supports_fast_auth(),
-            use_fast_auth
+            "auth path: server_fast_auth={}",
+            self.caps.supports_fast_auth()
         ));
-        if use_fast_auth {
+        // if fast authentication is possible, use it
+        if self.caps.supports_fast_auth() {
             let mut fast_auth_message = FastAuthMessage::new();
             self.override_ttc_field_version =
                 constants::FAST_AUTH_TTC_FIELD_VERSION;

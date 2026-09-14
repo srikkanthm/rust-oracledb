@@ -44,10 +44,19 @@ fn hex_dump(bytes: &[u8]) -> String {
 static ANO_TRACE_ON: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the ANO debug trace is enabled. It is opt-in (set
+/// `SQLHIGHLAND_ANO_TRACE`) so normal use never writes to the home directory.
+fn ano_trace_enabled() -> bool {
+    std::env::var_os("SQLHIGHLAND_ANO_TRACE").is_some()
+}
+
 /// Starts a fresh handshake trace (called at the beginning of ANO setup).
 pub(crate) fn ano_trace_start() {
-    let _ = std::fs::write(ano_log_path(), b"");
-    ANO_TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    let enabled = ano_trace_enabled();
+    if enabled {
+        let _ = std::fs::write(ano_log_path(), b"");
+    }
+    ANO_TRACE_ON.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Stops recording (called once the connection is fully established).
@@ -441,7 +450,8 @@ pub(crate) fn negotiate(
     transport: &mut Transport,
 ) -> Result<AnoSession, Error> {
     // Bound the handshake so a misbehaving server cannot hang the app, and
-    // record a trace for debugging.
+    // record a trace for debugging (only when tracing is enabled).
+    let traced = ano_trace_enabled();
     let _ = transport.set_read_timeout(Some(Duration::from_secs(20)));
     let mut trace = String::new();
     let result = negotiate_inner(transport, &mut trace);
@@ -453,10 +463,17 @@ pub(crate) fn negotiate(
     ano_trace(trace.trim_end());
     match result {
         Ok(session) => Ok(session),
-        Err(e) => Err(ano_err(&format!(
-            "{e} (handshake trace written to {})",
-            ano_log_path().display()
-        ))),
+        Err(e) => {
+            let suffix = if traced {
+                format!(
+                    " (handshake trace written to {})",
+                    ano_log_path().display()
+                )
+            } else {
+                String::new()
+            };
+            Err(ano_err(&format!("{e}{suffix}")))
+        }
     }
 }
 
