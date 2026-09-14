@@ -55,6 +55,23 @@ const NSI_SUPPORT_SECURITY_RENEG: u8 = 0x80;
 const PROTOCOL_CHARACTERISTICS: u16 = 0x4f98;
 const MAX_CONNECT_DATA: usize = 230;
 
+/// Returns the (global service options, connect flags 2) pair used to
+/// advertise out-of-band "attention" support.
+///
+/// OOB is a plain-TCP feature: the TCP urgent break cannot be carried through
+/// a TLS stream, and Oracle's own thin driver explicitly disables OOB for
+/// `tcps`. Never advertise it for `tcps`.
+fn connect_oob_flags(protocol: &str) -> (u16, u32) {
+    let supports_oob = cfg!(unix) && protocol != "tcps";
+    let service_options = if supports_oob {
+        GSO_DONT_CARE | GSO_CAN_RECV_ATTENTION
+    } else {
+        GSO_DONT_CARE
+    };
+    let connect_flags_2 = if supports_oob { TNS_CHECK_OOB } else { 0 };
+    (service_options, connect_flags_2)
+}
+
 pub struct ConnectMessage<'a> {
     pub connect_data: &'a str,
     description: &'a Description,
@@ -104,7 +121,14 @@ impl ConnectMessage<'_> {
         resp.advance(10)?;
         let flags1: u8 = resp.read_u8()?;
         if flags1 & NSI_NA_REQUIRED != 0 {
-            todo!();
+            // The server requires Native Network Encryption / Data Integrity,
+            // which this driver does not implement. Return a clear error
+            // instead of panicking in `todo!()`.
+            return Err(Error::not_implemented(
+                "native network encryption required by the server \
+                 (SQLNET.ENCRYPTION_SERVER=REQUIRED)"
+                    .to_string(),
+            ));
         }
         resp.advance(9)?;
         self.sdu = resp.read_u32be()?;
@@ -131,7 +155,9 @@ impl ConnectMessage<'_> {
             {
                 let error_num_str =
                     &message[start_pos + 5..start_pos + end_pos];
-                error_num = error_num_str.parse::<usize>().unwrap();
+                // A non-numeric code falls back to 0 ("unexpected refuse")
+                // instead of panicking on a malformed listener message.
+                error_num = error_num_str.parse::<usize>().unwrap_or(0);
             }
         }
         let connection_id = self.description.connection_id().to_string();
@@ -170,7 +196,8 @@ impl Message for ConnectMessage<'_> {
     ) -> Result<(), Error> {
         self.accepted = false;
         self.tls_renegotiation_needed = false;
-        match resp.get_packet_type() {
+        let packet_type = resp.get_packet_type();
+        match packet_type {
             constants::PACKET_TYPE_ACCEPT => {
                 self.process_accept_packet(resp)?;
             }
@@ -192,7 +219,15 @@ impl Message for ConnectMessage<'_> {
                 );
             }
             _ => {
-                todo!()
+                // Never panic on an unexpected response packet: surface the
+                // numeric type so the caller (and the user) can see what the
+                // server sent during the handshake.
+                eprintln!(
+                    "oracledb: unexpected packet type {packet_type} during connect"
+                );
+                return Err(Error::not_implemented(format!(
+                    "unexpected packet type {packet_type} during the connect handshake"
+                )));
             }
         }
         Ok(())
@@ -223,16 +258,10 @@ impl Message for ConnectMessage<'_> {
             }
         };
         let nsi_flags = NSI_SUPPORT_SECURITY_RENEG | NSI_DISABLE_NA;
-        // Advertise that this client can receive out-of-band "attention"
-        // (the TCP urgent break used to cancel a running statement). Without
-        // this the server ignores the break. OOB is Unix-only.
-        let supports_oob = cfg!(unix);
-        let service_options = if supports_oob {
-            GSO_DONT_CARE | GSO_CAN_RECV_ATTENTION
-        } else {
-            GSO_DONT_CARE
-        };
-        let connect_flags_2 = if supports_oob { TNS_CHECK_OOB } else { 0 };
+        // Advertise out-of-band "attention" support (the TCP urgent break used
+        // to cancel a running statement) only for plain TCP.
+        let (service_options, connect_flags_2) =
+            connect_oob_flags(self.address.protocol());
         buf.write_u16be(constants::PROTOCOL_VERSION_23);
         buf.write_u16be(constants::PROTOCOL_VERSION_MIN);
         buf.write_u16be(service_options);
@@ -265,5 +294,24 @@ impl Message for ConnectMessage<'_> {
         buf: &mut WriteBuffer,
     ) {
         buf.write_bytes(self.connect_data.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oob_advertised_only_on_plain_tcp() {
+        // TCPS never advertises attention, on any platform.
+        assert_eq!(connect_oob_flags("tcps"), (GSO_DONT_CARE, 0));
+        if cfg!(unix) {
+            assert_eq!(
+                connect_oob_flags("tcp"),
+                (GSO_DONT_CARE | GSO_CAN_RECV_ATTENTION, TNS_CHECK_OOB)
+            );
+        } else {
+            assert_eq!(connect_oob_flags("tcp"), (GSO_DONT_CARE, 0));
+        }
     }
 }

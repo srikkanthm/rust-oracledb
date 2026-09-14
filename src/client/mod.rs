@@ -218,14 +218,14 @@ impl Client {
             .and_then(|_| Err(err))
     }
 
-    /// Resets the transport after an error has taken place. All packets
-    /// received prior to a reset marker packet being received are discarded.
-    /// The packet received after the reset has completed is returned to the
-    /// caller. Note that some databases return multiple reset markers so
-    /// these are also accommodated.
+    /// Resets the transport after an error has taken place. Marker packets are
+    /// discarded and control packets consumed; the first real (data) packet is
+    /// returned to the caller. Note that some databases return multiple reset
+    /// markers, so these are also accommodated.
     fn reset(&mut self) -> Result<Packet, Error> {
         self.send_marker(constants::MARKER_TYPE_RESET)?;
-        // Discard any marker packets and return the first real (data) packet.
+        // Discard marker packets (and consume control packets), returning the
+        // first real (data) packet.
         //
         // The server may have already sent its reset marker before we sent
         // ours (the caller consumes that marker and then calls this), so
@@ -234,8 +234,16 @@ impl Client {
         // arrives as a data packet.
         loop {
             let packet = self.transport.receive_packet()?;
-            if packet.packet_type != constants::PACKET_TYPE_MARKER {
-                return Ok(packet);
+            match packet.packet_type {
+                constants::PACKET_TYPE_MARKER => continue,
+                constants::PACKET_TYPE_CONTROL => {
+                    // Control packets (e.g. in-band notifications) must be
+                    // consumed here; returning one to a message parser that
+                    // doesn't expect it would desync the protocol.
+                    self.process_control_packet(packet)?;
+                    continue;
+                }
+                _ => return Ok(packet),
             }
         }
     }
