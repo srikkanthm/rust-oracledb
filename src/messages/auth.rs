@@ -263,13 +263,44 @@ impl AuthMessage {
         encrypt_cbc_128(&password_hash, &client_key, &mut client_key_enc);
         self.add_pair_binary("AUTH_SESSKEY", &client_key_enc, 1);
 
-        // fold the trailing halves of both session keys into a combo key
-        let tail = server_key.len() - 16;
-        let mut combined = [0u8; 16];
-        for i in 0..16 {
-            combined[i] = server_key[tail + i] ^ client_key[16 + i];
-        }
-        let combo_key = md5_digest(&combined);
+        // Fold the session keys into the combo key. Modern servers send the
+        // PBKDF2 parameters and expect the derived key (as JDBC's O5Logon
+        // does); older servers fall back to the legacy XOR/MD5 fold.
+        let combo_key = match (
+            self.session_data.get("AUTH_PBKDF2_CSK_SALT"),
+            self.session_data.get("AUTH_PBKDF2_SDER_COUNT"),
+        ) {
+            (Some(salt), Some(iterations)) if !salt.is_empty() => {
+                let salt = base16ct::upper::decode_vec(salt).unwrap();
+                let iterations: u32 = iterations.parse().unwrap();
+                let mut temp = [0u8; 32];
+                temp[..16].copy_from_slice(&client_key[..16]);
+                temp[16..].copy_from_slice(&server_key[..16]);
+                let temp_key = base16ct::upper::encode_string(&temp);
+                let mut combo = [0u8; 16];
+                get_derived_key(
+                    temp_key.as_bytes(),
+                    &salt,
+                    iterations,
+                    &mut combo,
+                );
+                crate::advanced_nego::ano_trace(
+                    "auth 10g: combo key via PBKDF2 (keylen=16)",
+                );
+                combo
+            }
+            _ => {
+                let tail = server_key.len() - 16;
+                let mut combined = [0u8; 16];
+                for i in 0..16 {
+                    combined[i] = server_key[tail + i] ^ client_key[16 + i];
+                }
+                crate::advanced_nego::ano_trace(
+                    "auth 10g: combo key via legacy XOR/MD5",
+                );
+                md5_digest(&combined)
+            }
+        };
 
         // encrypt the password, prefixed with a random salt
         let mut salt = [0u8; 16];
