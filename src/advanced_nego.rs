@@ -191,8 +191,11 @@ fn build_encrypt() -> Vec<u8> {
 fn build_integrity() -> Vec<u8> {
     let mut body = Writer::default();
     body.sub_version();
-    // SHA256, SHA512, SHA384 (the AES-keystream integrity variants).
-    body.sub_bytes(&[5, 4, 6]);
+    // Offer "none" as well as the checksums. A server that only ACCEPTS
+    // checksums (the common default) then skips it; otherwise it can pick a
+    // hash. (Oracle re-keys the checksum on a reset, which the client cannot
+    // currently track, so avoiding a negotiated checksum is preferable.)
+    body.sub_bytes(&[0, 5, 4, 6]);
     service(SERVICE_INTEGRITY, 2, &body.buf)
 }
 
