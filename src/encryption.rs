@@ -285,6 +285,9 @@ impl Keystream {
 /// shared key. Send and receive use independent keystream state.
 pub struct Integrity {
     algo: IntegrityAlgo,
+    kdf_key: [u8; 16],
+    kdf_iv: [u8; 16],
+    kdf_buf: [u8; 32],
     encryptor: Keystream,
     decryptor: Keystream,
 }
@@ -298,28 +301,49 @@ impl Integrity {
         if key.len() < 5 || iv.len() < 16 {
             return Err("ANO integrity key/IV too short".to_string());
         }
-        let mut aes_key = [0u8; 16];
-        aes_key[..5].copy_from_slice(&key[..5]);
-        aes_key[5] = 0xFF;
-        let iv16: [u8; 16] = iv[..16].try_into().expect("iv len");
-
-        let mut derived = [0u8; 32];
-        cbc::Encryptor::<aes::Aes128>::new((&aes_key).into(), (&iv16).into())
-            .encrypt_padded_b2b::<NoPadding>(&[0u8; 32], &mut derived)
-            .expect("block aligned");
-        let block_key: [u8; 16] = derived[..16].try_into().expect("16");
-        let block_iv: [u8; 16] = derived[16..].try_into().expect("16");
-
-        let mut send_key = block_key;
-        send_key[5] = 90;
-        let mut recv_key = block_key;
-        recv_key[5] = 180;
-
-        Ok(Self {
+        let mut kdf_key = [0u8; 16];
+        kdf_key[..5].copy_from_slice(&key[..5]);
+        kdf_key[5] = 0xFF;
+        let kdf_iv: [u8; 16] = iv[..16].try_into().expect("iv len");
+        let size = algo.hash_size();
+        let mut this = Self {
             algo,
-            encryptor: Keystream::new(send_key, block_iv, algo.hash_size()),
-            decryptor: Keystream::new(recv_key, block_iv, algo.hash_size()),
-        })
+            kdf_key,
+            kdf_iv,
+            kdf_buf: [0u8; 32],
+            encryptor: Keystream::new([0u8; 16], [0u8; 16], size),
+            decryptor: Keystream::new([0u8; 16], [0u8; 16], size),
+        };
+        this.init();
+        Ok(this)
+    }
+
+    /// (Re)derives the send/receive keystreams. Called once at setup and again
+    /// after every reset, matching Oracle's per-request crypto state.
+    pub(crate) fn init(&mut self) {
+        let mut out = [0u8; 32];
+        cbc::Encryptor::<aes::Aes128>::new(
+            (&self.kdf_key).into(),
+            (&self.kdf_iv).into(),
+        )
+        .encrypt_padded_b2b::<NoPadding>(&self.kdf_buf, &mut out)
+        .expect("hash-sized buffer is block aligned");
+        self.kdf_buf = out;
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&out[..16]);
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&out[16..]);
+        // The next re-derivation uses CBC(key, iv), as Oracle does.
+        self.kdf_key = key;
+        self.kdf_iv = iv;
+
+        let mut send_key = key;
+        send_key[5] = 90;
+        let mut recv_key = key;
+        recv_key[5] = 180;
+        let size = self.algo.hash_size();
+        self.encryptor = Keystream::new(send_key, iv, size);
+        self.decryptor = Keystream::new(recv_key, iv, size);
     }
 
     pub fn hash_size(&self) -> usize {

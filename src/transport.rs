@@ -477,10 +477,11 @@ impl Transport {
     ) -> Result<Packet, Error> {
         if packet.packet_type == constants::PACKET_TYPE_DATA
             && (self.crypt.is_some() || self.hash.is_some())
+            && packet.buf.len() > 1
         {
-            if !packet.buf.is_empty() {
-                packet.buf.truncate(packet.buf.len() - 1);
-            }
+            // Strip the trailing folding byte, then decrypt and verify.
+            // (A body of just the folding byte is left untouched, as go-ora.)
+            packet.buf.truncate(packet.buf.len() - 1);
             if let Some(crypt) = self.crypt.as_ref() {
                 packet.buf = crypt
                     .decrypt(&packet.buf)
