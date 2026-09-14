@@ -619,6 +619,7 @@ impl Client {
     }
 
     fn connect_inner(&mut self) -> Result<DbInfo, Error> {
+        crate::advanced_nego::ano_trace_start();
         let mut result = Err(Error::unexpected_result());
         let options = self.config.get_options()?;
         for option in options.iter() {
@@ -696,6 +697,14 @@ impl Client {
         // before any TTC protocol/auth traffic goes out.
         let (acfl0, acfl1) = (connect_message.acfl0, connect_message.acfl1);
         let ano_offered = acfl0 & 1 != 0 && acfl0 & 4 == 0 && acfl1 & 8 == 0;
+        crate::advanced_nego::ano_trace(&format!(
+            "accept proto={} options={:#06x} acfl0={:#04x} acfl1={:#04x} ano={}",
+            connect_message.protocol_version,
+            connect_message.protocol_options,
+            acfl0,
+            acfl1,
+            ano_offered
+        ));
         if ano_offered {
             let ano = crate::advanced_nego::negotiate(&mut self.transport)?;
             self.transport.set_cryptor(ano.crypt);
@@ -713,8 +722,16 @@ impl Client {
     /// Performs the second phase of connecting to the database. Any errors
     /// that take place during this phase are returned directly to the caller.
     pub(crate) fn connect_phase_two(&mut self) -> Result<DbInfo, Error> {
-        // if fast authentication is possible, use it
-        if self.caps.supports_fast_auth() {
+        // Fast authentication is not exercised by our test servers; default to
+        // the well-tested O5LOGON path (set ORACLE_FORCE_FAST_AUTH=1 to opt in).
+        let use_fast_auth = self.caps.supports_fast_auth()
+            && std::env::var_os("ORACLE_FORCE_FAST_AUTH").is_some();
+        crate::advanced_nego::ano_trace(&format!(
+            "auth path: server_fast_auth={} using_fast={}",
+            self.caps.supports_fast_auth(),
+            use_fast_auth
+        ));
+        if use_fast_auth {
             let mut fast_auth_message = FastAuthMessage::new();
             self.override_ttc_field_version =
                 constants::FAST_AUTH_TTC_FIELD_VERSION;

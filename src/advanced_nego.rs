@@ -440,7 +440,6 @@ pub(crate) struct AnoSession {
 pub(crate) fn negotiate(
     transport: &mut Transport,
 ) -> Result<AnoSession, Error> {
-    ano_trace_start();
     // Bound the handshake so a misbehaving server cannot hang the app, and
     // record a trace for debugging.
     let _ = transport.set_read_timeout(Some(Duration::from_secs(20)));
@@ -450,7 +449,8 @@ pub(crate) fn negotiate(
     if let Err(e) = &result {
         trace.push_str(&format!("error: {e}\n"));
     }
-    let _ = std::fs::write(ano_log_path(), &trace);
+    // Append (ano_trace_start already cleared the file at connect start).
+    ano_trace(trace.trim_end());
     match result {
         Ok(session) => Ok(session),
         Err(e) => Err(ano_err(&format!(
