@@ -50,6 +50,9 @@ const TNS_CHECK_OOB: u32 = 0x01;
 const NSI_DISABLE_NA: u8 = 0x04;
 const NSI_NA_REQUIRED: u8 = 0x10;
 const NSI_SUPPORT_SECURITY_RENEG: u8 = 0x80;
+// Client advertises Advanced Networking Option (ANO) native-encryption
+// support. Must not be combined with NSI_DISABLE_NA.
+const NSI_ANO_SUPPORTED: u8 = 0x01;
 
 // other constants
 const PROTOCOL_CHARACTERISTICS: u16 = 0x4f98;
@@ -81,6 +84,11 @@ pub struct ConnectMessage<'a> {
     pub protocol_version: u16,
     pub protocol_options: u16,
     pub protocol_flags: u32,
+    /// Accept flags 0/1 — drive whether the ANO/NNE handshake runs.
+    pub acfl0: u8,
+    pub acfl1: u8,
+    /// Server signalled `NSI_NA_REQUIRED` (native encryption required).
+    pub na_required: bool,
     pub accepted: bool,
     pub tls_renegotiation_needed: bool,
     pub redirect_data: Option<String>,
@@ -102,6 +110,9 @@ impl ConnectMessage<'_> {
             protocol_version: 0,
             protocol_options: 0,
             protocol_flags: 0,
+            acfl0: 0,
+            acfl1: 0,
+            na_required: false,
             accepted: false,
             tls_renegotiation_needed: false,
             redirect_data: None,
@@ -120,17 +131,13 @@ impl ConnectMessage<'_> {
         self.protocol_options = resp.read_u16be()?;
         resp.advance(10)?;
         let flags1: u8 = resp.read_u8()?;
-        if flags1 & NSI_NA_REQUIRED != 0 {
-            // The server requires Native Network Encryption / Data Integrity,
-            // which this driver does not implement. Return a clear error
-            // instead of panicking in `todo!()`.
-            return Err(Error::not_implemented(
-                "native network encryption required by the server \
-                 (SQLNET.ENCRYPTION_SERVER=REQUIRED)"
-                    .to_string(),
-            ));
-        }
-        resp.advance(9)?;
+        self.acfl0 = flags1;
+        self.acfl1 = resp.read_u8()?;
+        // `NSI_NA_REQUIRED` is not fatal by itself: the server sets it whenever
+        // native encryption is required, and the ANO handshake satisfies it.
+        // `connect_phase_one` decides whether to negotiate or to fail loudly.
+        self.na_required = flags1 & NSI_NA_REQUIRED != 0;
+        resp.advance(8)?;
         self.sdu = resp.read_u32be()?;
         if self.protocol_version >= constants::PROTOCOL_VERSION_18 {
             resp.advance(5)?;
@@ -257,7 +264,15 @@ impl Message for ConnectMessage<'_> {
                 self.sdu.try_into().unwrap()
             }
         };
-        let nsi_flags = NSI_SUPPORT_SECURITY_RENEG | NSI_DISABLE_NA;
+        // Advertise ANO/NNE support on plain TCP (do NOT set NSI_DISABLE_NA),
+        // so a server with encryption REQUIRED runs the native-encryption
+        // handshake instead of rejecting us. TCPS carries its own encryption
+        // and disables ANO.
+        let nsi_flags = if self.address.protocol() == "tcps" {
+            NSI_SUPPORT_SECURITY_RENEG | NSI_DISABLE_NA
+        } else {
+            NSI_ANO_SUPPORTED
+        };
         // Advertise out-of-band "attention" support (the TCP urgent break used
         // to cancel a running statement) only for plain TCP.
         let (service_options, connect_flags_2) =

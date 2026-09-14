@@ -40,6 +40,7 @@ use crate::response::ResponseLocation;
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    AdvancedNegotiation(String),
     ArrowOperation,
     CallTimeoutExceeded,
     Cancelled,
@@ -181,6 +182,9 @@ impl From<arrow_schema::ArrowError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0.kind {
+            ErrorKind::AdvancedNegotiation(message) => {
+                write!(fmt, "advanced negotiation error: {}", message)?
+            }
             ErrorKind::ArrowOperation => {
                 fmt.write_str("Arrow operation failed")?
             }
@@ -658,6 +662,12 @@ impl Error {
 
     pub(crate) fn not_implemented(feature: String) -> Error {
         Error::new(ErrorKind::NotImplemented(feature), None)
+    }
+
+    /// A failure during the Advanced Networking Option (Native Network
+    /// Encryption) handshake.
+    pub(crate) fn advanced_negotiation(message: String) -> Error {
+        Error::new(ErrorKind::AdvancedNegotiation(message), None)
     }
 
     pub(crate) fn out_of_data() -> Error {

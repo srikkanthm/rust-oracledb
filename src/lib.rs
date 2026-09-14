@@ -32,6 +32,7 @@
 #![crate_name = "oracledb"]
 #![forbid(unsafe_code)]
 
+mod advanced_nego;
 #[cfg(feature = "arrow")]
 mod arrow;
 mod bind_params;
@@ -45,8 +46,6 @@ mod db_info;
 mod db_type;
 mod db_value;
 mod end_user_security_context;
-// Wired into the ANO handshake/transport in a follow-up commit.
-#[allow(dead_code)]
 mod encryption;
 mod error;
 mod exec_result;

@@ -56,6 +56,7 @@ use std::sync::Arc;
 use crate::config::Address;
 use crate::config::Config;
 use crate::constants;
+use crate::encryption::AesCryptor;
 use crate::error::Error;
 use crate::packet::Packet;
 
@@ -71,6 +72,9 @@ pub struct Transport {
     full_packet_size: bool,
     print_packets: bool,
     op_num: usize,
+    /// ANO/NNE session cryptor; when set, every DATA packet body is
+    /// hash/encrypt-wrapped on the way out and unwrapped on the way in.
+    crypt: Option<AesCryptor>,
 }
 
 // a custom client certificate resolver is required because the client
@@ -314,6 +318,7 @@ impl Transport {
             full_packet_size: false,
             print_packets: env::var_os("RSO_DEBUG_PACKETS").is_some(),
             op_num: 0,
+            crypt: None,
         }
     }
 
@@ -328,7 +333,7 @@ impl Transport {
         }
         loop {
             if let Some(packet) = self.extract_packet() {
-                return Ok(packet);
+                return self.transform_incoming(packet);
             }
             let num_bytes = self.read_packet()?;
             if num_bytes == 0 {
@@ -352,11 +357,26 @@ impl Transport {
         if packet_type == constants::PACKET_TYPE_DATA {
             header_size += 2;
         }
-        let max_data_size = self.max_packet_size - header_size;
+        // With ANO active, each DATA fragment grows by up to 16 padding bytes
+        // plus the trailing padding-count byte and the folding byte.
+        let encrypt =
+            packet_type == constants::PACKET_TYPE_DATA && self.crypt.is_some();
+        let reserve = if encrypt { 17 } else { 0 };
+        let max_data_size = self.max_packet_size - header_size - reserve;
         loop {
             let packet_data_size = min(max_data_size, data.len());
-            let packet_data = &data[..packet_data_size];
+            let fragment = &data[..packet_data_size];
             data = &data[packet_data_size..];
+            let transformed: Option<Vec<u8>> = if encrypt {
+                let mut buf =
+                    self.crypt.as_ref().expect("crypt").encrypt(fragment);
+                buf.push(0); // folding key
+                Some(buf)
+            } else {
+                None
+            };
+            let packet_data: &[u8] =
+                transformed.as_deref().unwrap_or(fragment);
             let packet_size = packet_data.len() + header_size;
             self.write_buf.clear();
             if self.full_packet_size {
@@ -410,6 +430,28 @@ impl Transport {
     /// Returns whether this transport is currently wrapped in TLS.
     pub(crate) fn uses_tls(&self) -> bool {
         self.tls_stream.is_some()
+    }
+
+    /// Installs the ANO/NNE cryptor negotiated during connect. When set, all
+    /// subsequent DATA packet bodies are encrypted/decrypted transparently.
+    pub(crate) fn set_cryptor(&mut self, cryptor: Option<AesCryptor>) {
+        self.crypt = cryptor;
+    }
+
+    /// Unwraps an incoming DATA packet body when ANO is active: strip the
+    /// folding byte, then decrypt the body.
+    fn transform_incoming(&self, mut packet: Packet) -> Result<Packet, Error> {
+        if packet.packet_type == constants::PACKET_TYPE_DATA
+            && let Some(crypt) = self.crypt.as_ref()
+        {
+            if !packet.buf.is_empty() {
+                packet.buf.truncate(packet.buf.len() - 1);
+            }
+            packet.buf = crypt
+                .decrypt(&packet.buf)
+                .map_err(Error::advanced_negotiation)?;
+        }
+        Ok(packet)
     }
 }
 
