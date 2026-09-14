@@ -56,7 +56,7 @@ use std::sync::Arc;
 use crate::config::Address;
 use crate::config::Config;
 use crate::constants;
-use crate::encryption::AesCryptor;
+use crate::encryption::{AesCryptor, Integrity};
 use crate::error::Error;
 use crate::packet::Packet;
 
@@ -75,6 +75,8 @@ pub struct Transport {
     /// ANO/NNE session cryptor; when set, every DATA packet body is
     /// hash/encrypt-wrapped on the way out and unwrapped on the way in.
     crypt: Option<AesCryptor>,
+    /// ANO/NNE checksum; when set, DATA bodies carry a trailing checksum.
+    hash: Option<Integrity>,
 }
 
 // a custom client certificate resolver is required because the client
@@ -319,6 +321,7 @@ impl Transport {
             print_packets: env::var_os("RSO_DEBUG_PACKETS").is_some(),
             op_num: 0,
             crypt: None,
+            hash: None,
         }
     }
 
@@ -357,24 +360,47 @@ impl Transport {
         if packet_type == constants::PACKET_TYPE_DATA {
             header_size += 2;
         }
-        // With ANO active, each DATA fragment grows by up to 16 padding bytes
-        // plus the trailing padding-count byte and the folding byte.
-        let encrypt =
-            packet_type == constants::PACKET_TYPE_DATA && self.crypt.is_some();
-        let reserve = if encrypt { 17 } else { 0 };
-        let max_data_size = self.max_packet_size - header_size - reserve;
+        // With ANO active, each DATA fragment grows by the hash length, up to
+        // 16 padding bytes, the trailing padding-count byte, and the folding
+        // byte.
+        let is_data = packet_type == constants::PACKET_TYPE_DATA;
+        let hash_size = if is_data {
+            self.hash.as_ref().map_or(0, Integrity::hash_size)
+        } else {
+            0
+        };
+        let pad = if is_data && self.crypt.is_some() {
+            16
+        } else {
+            0
+        };
+        let fold = if is_data && (self.crypt.is_some() || self.hash.is_some())
+        {
+            1
+        } else {
+            0
+        };
+        let max_data_size =
+            self.max_packet_size - header_size - hash_size - pad - fold;
         loop {
             let packet_data_size = min(max_data_size, data.len());
             let fragment = &data[..packet_data_size];
             data = &data[packet_data_size..];
-            let transformed: Option<Vec<u8>> = if encrypt {
-                let mut buf =
-                    self.crypt.as_ref().expect("crypt").encrypt(fragment);
-                buf.push(0); // folding key
-                Some(buf)
-            } else {
-                None
-            };
+            let transformed: Option<Vec<u8>> =
+                if is_data && (self.crypt.is_some() || self.hash.is_some()) {
+                    let mut buf = fragment.to_vec();
+                    if let Some(hash) = self.hash.as_mut() {
+                        let checksum = hash.compute(&buf);
+                        buf.extend_from_slice(&checksum);
+                    }
+                    if let Some(crypt) = self.crypt.as_ref() {
+                        buf = crypt.encrypt(&buf);
+                    }
+                    buf.push(0); // folding key
+                    Some(buf)
+                } else {
+                    None
+                };
             let packet_data: &[u8] =
                 transformed.as_deref().unwrap_or(fragment);
             let packet_size = packet_data.len() + header_size;
@@ -438,18 +464,33 @@ impl Transport {
         self.crypt = cryptor;
     }
 
+    /// Installs the ANO/NNE checksum negotiated during connect.
+    pub(crate) fn set_integrity(&mut self, integrity: Option<Integrity>) {
+        self.hash = integrity;
+    }
+
     /// Unwraps an incoming DATA packet body when ANO is active: strip the
-    /// folding byte, then decrypt the body.
-    fn transform_incoming(&self, mut packet: Packet) -> Result<Packet, Error> {
+    /// folding byte, decrypt, then verify/strip the checksum (reverse of send).
+    fn transform_incoming(
+        &mut self,
+        mut packet: Packet,
+    ) -> Result<Packet, Error> {
         if packet.packet_type == constants::PACKET_TYPE_DATA
-            && let Some(crypt) = self.crypt.as_ref()
+            && (self.crypt.is_some() || self.hash.is_some())
         {
             if !packet.buf.is_empty() {
                 packet.buf.truncate(packet.buf.len() - 1);
             }
-            packet.buf = crypt
-                .decrypt(&packet.buf)
-                .map_err(Error::advanced_negotiation)?;
+            if let Some(crypt) = self.crypt.as_ref() {
+                packet.buf = crypt
+                    .decrypt(&packet.buf)
+                    .map_err(Error::advanced_negotiation)?;
+            }
+            if let Some(hash) = self.hash.as_mut() {
+                packet.buf = hash
+                    .validate(&packet.buf)
+                    .map_err(Error::advanced_negotiation)?;
+            }
         }
         Ok(packet)
     }

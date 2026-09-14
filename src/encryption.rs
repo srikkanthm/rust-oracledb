@@ -11,6 +11,7 @@
 use aes::cipher::block_padding::NoPadding;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use num_bigint::BigUint;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 /// Encryption algorithms negotiated by the ANO "encrypt" service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +209,152 @@ pub fn dh_shared_key(
     out_len: usize,
 ) -> Vec<u8> {
     modpow_fixed(server_public, private, prime, out_len)
+}
+
+/// Data-integrity (checksum) algorithms negotiated by the ANO "integrity"
+/// service. Only the AES-keystream variants are implemented (MD5/SHA1 would
+/// need an RC4 keystream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityAlgo {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl IntegrityAlgo {
+    pub fn from_id(id: u8) -> Option<Self> {
+        match id {
+            5 => Some(Self::Sha256),
+            6 => Some(Self::Sha384),
+            4 => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    pub fn hash_size(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha256 => Sha256::digest(data).to_vec(),
+            Self::Sha384 => Sha384::digest(data).to_vec(),
+            Self::Sha512 => Sha512::digest(data).to_vec(),
+        }
+    }
+}
+
+/// A stateful AES-CBC keystream (the `OracleNetworkHash2` construction). Each
+/// `next` encrypts the running buffer in place; the buffer is the previous
+/// ciphertext, so the state advances exactly as Oracle's does.
+struct Keystream {
+    key: [u8; 16],
+    iv: [u8; 16],
+    buf: Vec<u8>,
+}
+
+impl Keystream {
+    fn new(key: [u8; 16], iv: [u8; 16], size: usize) -> Self {
+        Self {
+            key,
+            iv,
+            buf: vec![0u8; size],
+        }
+    }
+
+    fn next(&mut self) -> &[u8] {
+        let mut out = vec![0u8; self.buf.len()];
+        cbc::Encryptor::<aes::Aes128>::new(
+            (&self.key).into(),
+            (&self.iv).into(),
+        )
+        .encrypt_padded_b2b::<NoPadding>(&self.buf, &mut out)
+        .expect("hash-sized buffer is block aligned");
+        let last = out.len() - 16;
+        self.iv.copy_from_slice(&out[last..]);
+        self.buf = out;
+        &self.buf
+    }
+}
+
+/// Oracle ANO data integrity: appends/verifies a checksum derived from the DH
+/// shared key. Send and receive use independent keystream state.
+pub struct Integrity {
+    algo: IntegrityAlgo,
+    encryptor: Keystream,
+    decryptor: Keystream,
+}
+
+impl Integrity {
+    pub fn new(
+        algo: IntegrityAlgo,
+        key: &[u8],
+        iv: &[u8],
+    ) -> Result<Self, String> {
+        if key.len() < 5 || iv.len() < 16 {
+            return Err("ANO integrity key/IV too short".to_string());
+        }
+        let mut aes_key = [0u8; 16];
+        aes_key[..5].copy_from_slice(&key[..5]);
+        aes_key[5] = 0xFF;
+        let iv16: [u8; 16] = iv[..16].try_into().expect("iv len");
+
+        let mut derived = [0u8; 32];
+        cbc::Encryptor::<aes::Aes128>::new((&aes_key).into(), (&iv16).into())
+            .encrypt_padded_b2b::<NoPadding>(&[0u8; 32], &mut derived)
+            .expect("block aligned");
+        let block_key: [u8; 16] = derived[..16].try_into().expect("16");
+        let block_iv: [u8; 16] = derived[16..].try_into().expect("16");
+
+        let mut send_key = block_key;
+        send_key[5] = 90;
+        let mut recv_key = block_key;
+        recv_key[5] = 180;
+
+        Ok(Self {
+            algo,
+            encryptor: Keystream::new(send_key, block_iv, algo.hash_size()),
+            decryptor: Keystream::new(recv_key, block_iv, algo.hash_size()),
+        })
+    }
+
+    pub fn hash_size(&self) -> usize {
+        self.algo.hash_size()
+    }
+
+    /// Returns `data || checksum`, to be encrypted afterwards.
+    pub fn compute(&mut self, data: &[u8]) -> Vec<u8> {
+        let keystream = self.encryptor.next().to_vec();
+        let mut combined = Vec::with_capacity(data.len() + keystream.len());
+        combined.extend_from_slice(data);
+        combined.extend_from_slice(&keystream);
+        self.algo.digest(&combined)
+    }
+
+    /// Verifies and strips the trailing checksum.
+    pub fn validate(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let size = self.algo.hash_size();
+        if data.len() <= size {
+            return Err("data integrity check failed: short input".to_string());
+        }
+        let split = data.len() - size;
+        let original = &data[..split];
+        let received = &data[split..];
+        let keystream = self.decryptor.next().to_vec();
+        let mut combined =
+            Vec::with_capacity(original.len() + keystream.len());
+        combined.extend_from_slice(original);
+        combined.extend_from_slice(&keystream);
+        if self.algo.digest(&combined) == received {
+            Ok(original.to_vec())
+        } else {
+            Err("data integrity check failed".to_string())
+        }
+    }
 }
 
 #[cfg(test)]

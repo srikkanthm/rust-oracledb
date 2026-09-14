@@ -13,7 +13,8 @@ use rand::RngExt;
 
 use crate::constants;
 use crate::encryption::{
-    AesCryptor, EncryptAlgo, dh_public_key, dh_shared_key,
+    AesCryptor, EncryptAlgo, Integrity, IntegrityAlgo, dh_public_key,
+    dh_shared_key,
 };
 use crate::error::Error;
 use crate::transport::Transport;
@@ -139,7 +140,8 @@ fn build_encrypt() -> Vec<u8> {
 fn build_integrity() -> Vec<u8> {
     let mut body = Writer::default();
     body.sub_version();
-    body.sub_bytes(&[0]); // no checksum
+    // SHA256, SHA512, SHA384 (the AES-keystream integrity variants).
+    body.sub_bytes(&[5, 4, 6]);
     service(SERVICE_INTEGRITY, 2, &body.buf)
 }
 
@@ -225,11 +227,14 @@ struct DhParams {
     generator: Vec<u8>,
     prime: Vec<u8>,
     server_public: Vec<u8>,
+    iv: Vec<u8>,
     byte_len: usize,
 }
 
 struct ServerInfo {
     encrypt_algo: Option<EncryptAlgo>,
+    /// Raw integrity algorithm id from the server (0 = none).
+    integrity_algo: Option<u8>,
     dh: Option<DhParams>,
 }
 
@@ -245,6 +250,7 @@ fn parse_server_response(buf: &[u8]) -> Result<ServerInfo, Error> {
 
     let mut info = ServerInfo {
         encrypt_algo: None,
+        integrity_algo: None,
         dh: None,
     };
     for _ in 0..service_count {
@@ -270,6 +276,12 @@ fn parse_server_response(buf: &[u8]) -> Result<ServerInfo, Error> {
                 for _ in 0..sub_packets {
                     subs.push(reader.sub()?);
                 }
+                // sub-packet 1 is the chosen integrity algorithm id.
+                if let Some(payload) = subs.get(1).map(|(_, p)| p)
+                    && !payload.is_empty()
+                {
+                    info.integrity_algo = Some(payload[0]);
+                }
                 // DH is sent only when encryption is being negotiated, as
                 // eight sub-packets: version, ub1, ub2, ub2, bytes x4.
                 if sub_packets == 8 && subs.len() == 8 {
@@ -279,6 +291,7 @@ fn parse_server_response(buf: &[u8]) -> Result<ServerInfo, Error> {
                     let generator = subs[4].1.clone();
                     let prime = subs[5].1.clone();
                     let server_public = subs[6].1.clone();
+                    let iv = subs[7].1.clone();
                     let byte_len = dh_gen_len.div_ceil(8);
                     if server_public.len() != byte_len
                         || prime.len() != byte_len
@@ -291,6 +304,7 @@ fn parse_server_response(buf: &[u8]) -> Result<ServerInfo, Error> {
                         generator,
                         prime,
                         server_public,
+                        iv,
                         byte_len,
                     });
                 }
@@ -314,11 +328,28 @@ fn receive_ano_data(transport: &mut Transport) -> Result<Vec<u8>, Error> {
         let packet = transport.receive_packet()?;
         match packet.packet_type {
             constants::PACKET_TYPE_DATA => return Ok(packet.buf),
-            // Control packets (in-band notifications) and marker packets are
-            // not part of the ANO exchange; consume them and keep reading.
-            constants::PACKET_TYPE_CONTROL | constants::PACKET_TYPE_MARKER => {
+            // Control packets (in-band notifications) are not part of the ANO
+            // exchange, but may carry an ORA error worth surfacing instead of
+            // silently hanging.
+            constants::PACKET_TYPE_CONTROL => {
+                if packet.buf.len() >= 10
+                    && u16::from_be_bytes(
+                        packet.buf[0..2].try_into().expect("2"),
+                    ) == constants::TTC_CONTROL_TYPE_INBAND_NOTIF
+                {
+                    let err = u32::from_be_bytes(
+                        packet.buf[6..10].try_into().expect("4"),
+                    );
+                    if err != 0 {
+                        return Err(ano_err(&format!(
+                            "server reported ORA-{err:05} during the ANO \
+                             handshake"
+                        )));
+                    }
+                }
                 continue;
             }
+            constants::PACKET_TYPE_MARKER => continue,
             other => {
                 return Err(ano_err(&format!(
                     "expected a DATA packet, got type {other}"
@@ -328,18 +359,27 @@ fn receive_ano_data(transport: &mut Transport) -> Result<Vec<u8>, Error> {
     }
 }
 
-/// Runs the ANO handshake and returns the negotiated AES cryptor, if the
-/// server requested encryption. `None` means the server did not enable ANO.
+/// The negotiated ANO session: AES encryption and (optionally) a checksum.
+pub(crate) struct AnoSession {
+    pub crypt: Option<AesCryptor>,
+    pub integrity: Option<Integrity>,
+}
+
+/// Runs the ANO handshake and returns the negotiated crypto, if any. Both
+/// fields are `None` when the server did not enable ANO.
 pub(crate) fn negotiate(
     transport: &mut Transport,
-) -> Result<Option<AesCryptor>, Error> {
+) -> Result<AnoSession, Error> {
     send_ano_data(transport, &build_client_request())?;
     let response = receive_ano_data(transport)?;
     let info = parse_server_response(&response)?;
 
     let Some(dh) = info.dh else {
         // No Diffie-Hellman exchange means no encryption was negotiated.
-        return Ok(None);
+        return Ok(AnoSession {
+            crypt: None,
+            integrity: None,
+        });
     };
 
     let mut private_key = vec![0u8; dh.byte_len];
@@ -351,12 +391,23 @@ pub(crate) fn negotiate(
 
     send_ano_data(transport, &build_client_public_key(&public_key))?;
 
-    match info.encrypt_algo {
+    let crypt = match info.encrypt_algo {
         Some(algo) => {
-            let cryptor =
-                AesCryptor::new(algo, &shared_key).map_err(|e| ano_err(&e))?;
-            Ok(Some(cryptor))
+            Some(AesCryptor::new(algo, &shared_key).map_err(|e| ano_err(&e))?)
         }
-        None => Ok(None),
-    }
+        None => None,
+    };
+    let integrity = match info.integrity_algo {
+        Some(id) if id != 0 => {
+            let algo = IntegrityAlgo::from_id(id).ok_or_else(|| {
+                ano_err(&format!("unsupported integrity algorithm {id}"))
+            })?;
+            Some(
+                Integrity::new(algo, &shared_key, &dh.iv)
+                    .map_err(|e| ano_err(&e))?,
+            )
+        }
+        _ => None,
+    };
+    Ok(AnoSession { crypt, integrity })
 }

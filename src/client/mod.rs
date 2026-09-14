@@ -678,11 +678,9 @@ impl Client {
         let (acfl0, acfl1) = (connect_message.acfl0, connect_message.acfl1);
         let ano_offered = acfl0 & 1 != 0 && acfl0 & 4 == 0 && acfl1 & 8 == 0;
         if ano_offered {
-            if let Some(cryptor) =
-                crate::advanced_nego::negotiate(&mut self.transport)?
-            {
-                self.transport.set_cryptor(Some(cryptor));
-            }
+            let ano = crate::advanced_nego::negotiate(&mut self.transport)?;
+            self.transport.set_cryptor(ano.crypt);
+            self.transport.set_integrity(ano.integrity);
         } else if connect_message.na_required {
             return Err(Error::advanced_negotiation(
                 "server requires native network encryption but did not offer \
