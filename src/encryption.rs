@@ -211,6 +211,44 @@ pub fn dh_shared_key(
     modpow_fixed(server_public, private, prime, out_len)
 }
 
+/// Computes the Oracle 10G (O3LOGON) password verifier.
+///
+/// The verifier is derived from the case-insensitive (upper-cased) username
+/// and password, encoded as UTF-16BE and zero padded to a multiple of eight
+/// bytes. That buffer is DES-CBC encrypted twice with an all-zero IV: the
+/// first pass uses the fixed key `0x0123456789ABCDEF`, the second pass uses
+/// the last ciphertext block of the first pass. Only the final block is kept.
+pub fn oracle10g_verifier(user: &str, password: &[u8]) -> [u8; 8] {
+    let mut data = Vec::with_capacity((user.len() + password.len()) * 2);
+    for byte in user
+        .bytes()
+        .chain(password.iter().copied())
+        .map(|b| b.to_ascii_uppercase())
+    {
+        data.push(0);
+        data.push(byte);
+    }
+    while !data.len().is_multiple_of(8) {
+        data.push(0);
+    }
+    let key1 = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    let first = des_cbc_encrypt(&key1, &data);
+    let key2: [u8; 8] = first[first.len() - 8..].try_into().expect("block");
+    let second = des_cbc_encrypt(&key2, &data);
+    second[second.len() - 8..].try_into().expect("block")
+}
+
+/// DES-CBC encryption with an all-zero IV (no padding is added; `data` must
+/// already be a multiple of eight bytes).
+fn des_cbc_encrypt(key: &[u8; 8], data: &[u8]) -> Vec<u8> {
+    let iv = [0u8; 8];
+    let mut out = vec![0u8; data.len()];
+    cbc::Encryptor::<des::Des>::new(key.into(), (&iv).into())
+        .encrypt_padded_b2b::<NoPadding>(data, &mut out)
+        .expect("data is 8-byte aligned");
+    out
+}
+
 /// Data-integrity (checksum) algorithms negotiated by the ANO "integrity"
 /// service. Only the AES-keystream variants are implemented (MD5/SHA1 would
 /// need an RC4 keystream).
@@ -421,6 +459,18 @@ mod tests {
         assert_eq!(a_shared, b_shared);
         // 2^(5*7) mod 23 = 4.
         assert_eq!(a_shared, vec![4u8]);
+    }
+
+    #[test]
+    fn oracle10g_verifier_matches_known_vector() {
+        // passlib: oracle10.hash("password", user="username") = 872805F3F4C83365
+        let verifier = oracle10g_verifier("username", b"password");
+        assert_eq!(
+            base16ct::upper::encode_string(&verifier),
+            "872805F3F4C83365"
+        );
+        // The verifier is case-insensitive on both the user and password.
+        assert_eq!(oracle10g_verifier("USERNAME", b"PASSWORD"), verifier);
     }
 
     #[test]

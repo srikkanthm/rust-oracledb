@@ -47,6 +47,12 @@ use crate::write_buffer::WriteBuffer;
 
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+/// Verifier type reported by the server for 10G-only (case-insensitive)
+/// password verifiers; these use the legacy O3LOGON exchange.
+const TNS_VERIFIER_TYPE_10G: u32 = 0x0939;
 
 struct Pair {
     key: String,
@@ -78,6 +84,34 @@ fn encrypt_cbc(key: &[u8; 32], plain_text: &[u8], encrypted_text: &mut [u8]) {
         .unwrap();
 }
 
+fn decrypt_cbc_128(
+    key: &[u8; 16],
+    encrypted_text: &[u8],
+    plain_text: &mut [u8],
+) {
+    let iv = [0u8; 16];
+    Aes128CbcDec::new(key.into(), &iv.into())
+        .decrypt_padded_b2b::<NoPadding>(encrypted_text, plain_text)
+        .unwrap();
+}
+
+fn encrypt_cbc_128(
+    key: &[u8; 16],
+    plain_text: &[u8],
+    encrypted_text: &mut [u8],
+) {
+    let iv = [0u8; 16];
+    Aes128CbcEnc::new(key.into(), &iv.into())
+        .encrypt_padded_b2b::<NoPadding>(plain_text, encrypted_text)
+        .unwrap();
+}
+
+/// MD5 digest, used to fold the server and client session keys together for
+/// 10G (O3LOGON) verifiers.
+fn md5_digest(data: &[u8]) -> [u8; 16] {
+    <md5::Md5 as md5::Digest>::digest(data).into()
+}
+
 fn get_derived_key(
     key: &[u8],
     salt: &[u8],
@@ -91,6 +125,7 @@ pub struct AuthMessage {
     pub session_data: HashMap<String, String>,
     pairs: Vec<Pair>,
     combo_key: Option<[u8; 32]>,
+    verifier_type: Option<u32>,
     resend_needed: bool,
 }
 
@@ -192,8 +227,70 @@ impl AuthMessage {
     }
 
     /// Generates the password verifier and the various keys required by the
-    /// server for validation.
+    /// server for validation, selecting the exchange that matches the
+    /// verifier type the server reported.
     fn generate_verifier(&mut self, client: &mut Client) {
+        if self.verifier_type == Some(TNS_VERIFIER_TYPE_10G) {
+            self.generate_verifier_10g(client);
+        } else {
+            self.generate_verifier_12c(client);
+        }
+    }
+
+    /// Generates the response for a 10G (O3LOGON) password verifier. The
+    /// verifier is a DES-derived eight byte value used as the leading bytes of
+    /// a 16 byte AES-128 key; the remaining exchange mirrors the 11G/12C flow
+    /// but with AES-128 and a MD5-folded combo key.
+    fn generate_verifier_10g(&mut self, client: &mut Client) {
+        let user = client.config().user().expect("user is set").to_string();
+        let password = client.config().get_password_bytes();
+        let verifier = crate::encryption::oracle10g_verifier(&user, &password);
+        let mut password_hash = [0u8; 16];
+        password_hash[..8].copy_from_slice(&verifier);
+
+        // decrypt the server's session key
+        let encoded_server_key = base16ct::upper::decode_vec(
+            self.session_data.get("AUTH_SESSKEY").expect("AUTH_SESSKEY"),
+        )
+        .unwrap();
+        let mut server_key = vec![0u8; encoded_server_key.len()];
+        decrypt_cbc_128(&password_hash, &encoded_server_key, &mut server_key);
+
+        // generate and encrypt this client's session key
+        let mut client_key = [0u8; 32];
+        rand::rng().fill(&mut client_key);
+        let mut client_key_enc = [0u8; 32];
+        encrypt_cbc_128(&password_hash, &client_key, &mut client_key_enc);
+        self.add_pair_binary("AUTH_SESSKEY", &client_key_enc, 1);
+
+        // fold the trailing halves of both session keys into a combo key
+        let tail = server_key.len() - 16;
+        let mut combined = [0u8; 16];
+        for i in 0..16 {
+            combined[i] = server_key[tail + i] ^ client_key[16 + i];
+        }
+        let combo_key = md5_digest(&combined);
+
+        // encrypt the password, prefixed with a random salt
+        let mut salt = [0u8; 16];
+        rand::rng().fill(&mut salt);
+        let mut plain = Vec::with_capacity(16 + password.len() + 16);
+        plain.extend_from_slice(&salt);
+        plain.extend_from_slice(&password);
+        let pad = 16 - (plain.len() % 16);
+        plain.extend(std::iter::repeat_n(pad as u8, pad));
+        let mut encrypted = vec![0u8; plain.len()];
+        encrypt_cbc_128(&combo_key, &plain, &mut encrypted);
+        self.add_pair(
+            "AUTH_PASSWORD",
+            &base16ct::upper::encode_string(&encrypted),
+            0,
+        );
+    }
+
+    /// Generates the response for an 11G/12C password verifier (the modern
+    /// AES-256 / PBKDF2 exchange).
+    fn generate_verifier_12c(&mut self, client: &mut Client) {
         // create password hash
         let iterations: u32 = self
             .session_data
@@ -426,6 +523,7 @@ impl AuthMessage {
             session_data: HashMap::new(),
             pairs: Vec::<Pair>::new(),
             combo_key: None,
+            verifier_type: None,
             resend_needed: false,
         }
     }
@@ -452,9 +550,18 @@ impl Message for AuthMessage {
         for _ in 0..num_params {
             let key = resp.read_utf8_with_double_length()?.to_string();
             let value = resp.read_utf8_with_double_length()?.to_string();
-            resp.read_ub4()?; // flags
+            let flags = resp.read_ub4()?;
+            // For AUTH_VFR_DATA this field carries the password verifier type
+            // rather than ordinary flags.
+            if key == "AUTH_VFR_DATA" {
+                self.verifier_type = Some(flags);
+            }
             self.session_data.insert(key, value);
         }
+        crate::advanced_nego::ano_trace(&format!(
+            "auth verifier_type={:?} n_params={}",
+            self.verifier_type, num_params
+        ));
         Ok(())
     }
 

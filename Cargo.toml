@@ -44,6 +44,10 @@ base16ct = { version = "1.0.0", features = ["alloc"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 cbc = "0.2.1"
 chrono = "0.4.45"
+# Oracle 10G password verifiers (O3LOGON) require single DES and MD5, in
+# addition to the AES/SHA-2 primitives used by 11G/12C verifiers.
+des = "0.9.0"
+md-5 = "0.10.6"
 # Native Network Encryption (ANO/NNE): Diffie-Hellman key agreement uses
 # arbitrary-precision modular exponentiation.
 num-bigint = "0.5"
