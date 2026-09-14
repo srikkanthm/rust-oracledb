@@ -135,19 +135,31 @@ impl Client {
     fn receive_data_packet(&mut self) -> Result<(Packet, bool), Error> {
         loop {
             match self.transport.receive_packet() {
-                Ok(packet) => match packet.packet_type {
-                    constants::PACKET_TYPE_CONTROL => {
-                        self.process_control_packet(packet)?;
-                        continue;
+                Ok(packet) => {
+                    if packet.packet_type == constants::PACKET_TYPE_MARKER
+                        || packet.packet_type == constants::PACKET_TYPE_CONTROL
+                    {
+                        crate::advanced_nego::ano_trace(&format!(
+                            "client recv type={} flags={} len={}",
+                            packet.packet_type,
+                            packet.packet_flags,
+                            packet.buf.len()
+                        ));
                     }
-                    constants::PACKET_TYPE_MARKER => {
-                        let packet = self
-                            .reset()
-                            .map_err(|_| self.unrecoverable_error())?;
-                        return Ok((packet, false));
+                    match packet.packet_type {
+                        constants::PACKET_TYPE_CONTROL => {
+                            self.process_control_packet(packet)?;
+                            continue;
+                        }
+                        constants::PACKET_TYPE_MARKER => {
+                            let packet = self
+                                .reset()
+                                .map_err(|_| self.unrecoverable_error())?;
+                            return Ok((packet, false));
+                        }
+                        _ => return Ok((packet, true)),
                     }
-                    _ => return Ok((packet, true)),
-                },
+                }
                 Err(err) => {
                     if err.is_call_timeout_exceeded() {
                         let packet = self.recover_from_error(err)?;
@@ -600,6 +612,13 @@ impl Client {
     /// Establishes a connection to the database and returns the client object
     /// as well as database info.
     pub(crate) fn connect(&mut self) -> Result<DbInfo, Error> {
+        let result = self.connect_inner();
+        // The ANO handshake trace covers the whole connect; stop once done.
+        crate::advanced_nego::ano_trace_stop();
+        result
+    }
+
+    fn connect_inner(&mut self) -> Result<DbInfo, Error> {
         let mut result = Err(Error::unexpected_result());
         let options = self.config.get_options()?;
         for option in options.iter() {

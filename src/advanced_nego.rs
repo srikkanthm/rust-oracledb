@@ -40,6 +40,36 @@ fn hex_dump(bytes: &[u8]) -> String {
     out
 }
 
+/// Whether the handshake trace is currently being recorded.
+static ANO_TRACE_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Starts a fresh handshake trace (called at the beginning of ANO setup).
+pub(crate) fn ano_trace_start() {
+    let _ = std::fs::write(ano_log_path(), b"");
+    ANO_TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stops recording (called once the connection is fully established).
+pub(crate) fn ano_trace_stop() {
+    ANO_TRACE_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Appends a line to the handshake trace while it is enabled.
+pub(crate) fn ano_trace(message: &str) {
+    if !ANO_TRACE_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ano_log_path())
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
 const ANO_MAGIC: u32 = 0xDEAD_BEEF;
 const ANO_VERSION: u32 = 0x0B20_0200;
 
@@ -407,6 +437,7 @@ pub(crate) struct AnoSession {
 pub(crate) fn negotiate(
     transport: &mut Transport,
 ) -> Result<AnoSession, Error> {
+    ano_trace_start();
     // Bound the handshake so a misbehaving server cannot hang the app, and
     // record a trace for debugging.
     let _ = transport.set_read_timeout(Some(Duration::from_secs(20)));
@@ -456,6 +487,14 @@ fn negotiate_inner(
     let shared_key =
         dh_shared_key(&dh.server_public, &private_key, &dh.prime, dh.byte_len);
 
+    trace.push_str(&format!(
+        "negotiated encrypt={:?} integrity={:?} dh_byte_len={} shared_len={} public_len={}\n",
+        info.encrypt_algo,
+        info.integrity_algo,
+        dh.byte_len,
+        shared_key.len(),
+        public_key.len()
+    ));
     send_ano_data(transport, &build_client_public_key(&public_key))?;
 
     let crypt = match info.encrypt_algo {
@@ -476,5 +515,10 @@ fn negotiate_inner(
         }
         _ => None,
     };
+    trace.push_str(&format!(
+        "crypt={} integrity={}\n",
+        crypt.is_some(),
+        integrity.is_some()
+    ));
     Ok(AnoSession { crypt, integrity })
 }

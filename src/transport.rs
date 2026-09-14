@@ -483,14 +483,27 @@ impl Transport {
             // (A body of just the folding byte is left untouched, as go-ora.)
             packet.buf.truncate(packet.buf.len() - 1);
             if let Some(crypt) = self.crypt.as_ref() {
-                packet.buf = crypt
-                    .decrypt(&packet.buf)
-                    .map_err(Error::advanced_negotiation)?;
+                match crypt.decrypt(&packet.buf) {
+                    Ok(value) => packet.buf = value,
+                    Err(e) => {
+                        crate::advanced_nego::ano_trace(&format!(
+                            "decrypt failed: {e}"
+                        ));
+                        return Err(Error::advanced_negotiation(e));
+                    }
+                }
             }
             if let Some(hash) = self.hash.as_mut() {
-                packet.buf = hash
-                    .validate(&packet.buf)
-                    .map_err(Error::advanced_negotiation)?;
+                match hash.validate(&packet.buf) {
+                    Ok(value) => packet.buf = value,
+                    Err(e) => {
+                        crate::advanced_nego::ano_trace(&format!(
+                            "validate failed: {e} (len {})",
+                            packet.buf.len()
+                        ));
+                        return Err(Error::advanced_negotiation(e));
+                    }
+                }
             }
         }
         Ok(packet)
