@@ -310,14 +310,22 @@ fn send_ano_data(transport: &mut Transport, data: &[u8]) -> Result<(), Error> {
 }
 
 fn receive_ano_data(transport: &mut Transport) -> Result<Vec<u8>, Error> {
-    let packet = transport.receive_packet()?;
-    if packet.packet_type != constants::PACKET_TYPE_DATA {
-        return Err(ano_err(&format!(
-            "expected a DATA packet, got type {}",
-            packet.packet_type
-        )));
+    loop {
+        let packet = transport.receive_packet()?;
+        match packet.packet_type {
+            constants::PACKET_TYPE_DATA => return Ok(packet.buf),
+            // Control packets (in-band notifications) and marker packets are
+            // not part of the ANO exchange; consume them and keep reading.
+            constants::PACKET_TYPE_CONTROL | constants::PACKET_TYPE_MARKER => {
+                continue;
+            }
+            other => {
+                return Err(ano_err(&format!(
+                    "expected a DATA packet, got type {other}"
+                )));
+            }
+        }
     }
-    Ok(packet.buf)
 }
 
 /// Runs the ANO handshake and returns the negotiated AES cryptor, if the
