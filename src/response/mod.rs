@@ -168,9 +168,13 @@ impl Response {
     }
 
     pub(crate) fn deserialize_bit_vector(&mut self) -> Result<(), Error> {
-        let num_columns = self.read_ub2()? as usize;
+        // The wire field is the number of columns the server chose to send and
+        // is informational: the bitmap always covers the statement's full
+        // column count (`num_columns`, set from the metadata before rows are
+        // read). Fall back to the wire value only when the count is unknown.
+        let num_columns_sent = self.read_ub2()? as usize;
         if self.num_columns == 0 {
-            self.num_columns = num_columns;
+            self.num_columns = num_columns_sent;
         }
         let mut num_bytes = self.num_columns / 8;
         if !self.num_columns.is_multiple_of(8) {
@@ -200,6 +204,14 @@ impl Response {
             rows.push(db_row);
         } else {
             self.rows = Some(vec![db_row]);
+        }
+        // The bit vector describes duplicate columns for *this* row only. A
+        // later row that has no bit vector message must not inherit it —
+        // otherwise `is_duplicate_data` reports columns as duplicates and the
+        // reader skips their bytes, desyncing the response stream. Matches
+        // python-oracledb (`self.bit_vector = NULL` after each row in a fetch).
+        if in_fetch {
+            self.bit_vector = None;
         }
         Ok(())
     }
@@ -370,7 +382,12 @@ impl Response {
         if let Some(bit_vector) = self.bit_vector.as_ref() {
             let byte_num = column_num / 8;
             let bit_num = column_num % 8;
-            bit_vector[byte_num] & (1 << bit_num) == 0
+            match bit_vector.get(byte_num) {
+                Some(byte) => byte & (1 << bit_num) == 0,
+                // A shorter-than-expected bitmap (malformed/short response)
+                // must not panic the app; treat the column as having data.
+                None => false,
+            }
         } else {
             false
         }
@@ -614,5 +631,71 @@ pub struct ResponseLocation {
 impl std::fmt::Display for ResponseLocation {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(fmt, "packet {}, offset {}", self.packet_num, self.offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a DATA packet whose body is `body` (the 10-byte header carries a
+    /// valid packet type so `Packet::new` strips it and keeps `body`).
+    fn data_packet(body: &[u8]) -> Packet {
+        let mut buf = vec![0u8; 10];
+        buf[4] = constants::PACKET_TYPE_DATA;
+        buf.extend_from_slice(body);
+        Packet::new(&buf)
+    }
+
+    /// Encode a `ub2` the way TTC does: a length byte followed by the bytes.
+    fn ttc_ub2(value: u16) -> Vec<u8> {
+        if value <= 0xFF {
+            vec![1, value as u8]
+        } else {
+            vec![2, (value >> 8) as u8, value as u8]
+        }
+    }
+
+    #[test]
+    fn duplicate_data_uses_bit_vector_and_bounds() {
+        let mut resp = Response::new();
+        // Byte 0: bits 0 and 2 set (columns 0/2 have data); byte 1: bit 0 set.
+        resp.bit_vector = Some(vec![0b0000_0101, 0b0000_0001]);
+        assert!(!resp.is_duplicate_data(0)); // bit set -> data sent
+        assert!(resp.is_duplicate_data(1)); // bit clear -> duplicate
+        assert!(!resp.is_duplicate_data(2));
+        assert!(resp.is_duplicate_data(3));
+        assert!(!resp.is_duplicate_data(8)); // second byte, bit set
+        // Out of range must not panic.
+        assert!(!resp.is_duplicate_data(64));
+        // No bit vector -> never a duplicate.
+        resp.bit_vector = None;
+        assert!(!resp.is_duplicate_data(1));
+    }
+
+    #[test]
+    fn bit_vector_length_uses_column_count_not_wire_value() {
+        // Body: wire num_columns = 8 (informational), then 2 bitmap bytes.
+        let mut body = ttc_ub2(8);
+        body.extend_from_slice(&[0xFF, 0xFF]);
+        let mut resp = Response::new();
+        resp.buf = ReadBuffer::from_packets(&[data_packet(&body)]);
+        resp.num_columns = 16; // full column count (from the metadata)
+        resp.deserialize_bit_vector().unwrap();
+        // Length is ceil(16/8) = 2, not ceil(8/8) = 1.
+        assert_eq!(resp.bit_vector.as_ref().unwrap().len(), 2);
+        assert!(!resp.is_duplicate_data(15));
+    }
+
+    #[test]
+    fn bit_vector_length_falls_back_to_wire_when_count_unknown() {
+        let mut body = ttc_ub2(8);
+        body.extend_from_slice(&[0xFF]);
+        let mut resp = Response::new();
+        resp.buf = ReadBuffer::from_packets(&[data_packet(&body)]);
+        resp.num_columns = 0;
+        resp.deserialize_bit_vector().unwrap();
+        assert_eq!(resp.bit_vector.as_ref().unwrap().len(), 1);
+        assert_eq!(resp.num_columns, 8);
     }
 }

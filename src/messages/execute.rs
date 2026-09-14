@@ -313,6 +313,10 @@ impl Message for ExecuteMessage<'_, '_> {
         self.statement.populate_from_describe_info(client, resp)?;
         let num_metadata = self.statement.out_metadata().len();
         self.num_fetch_columns = num_metadata.try_into().unwrap();
+        // The bit vector length is derived from the full column count, so make
+        // it known as soon as the metadata is (the server's own num_columns
+        // field is informational only).
+        resp.set_num_columns(num_metadata);
         Ok(())
     }
 
@@ -384,6 +388,14 @@ impl Message for ExecuteMessage<'_, '_> {
         self.statement.set_cursor_id(resp.get_cursor_id());
         self.statement.set_binds_not_changed();
         resp.check_for_end_of_fetch(self.statement)
+    }
+
+    fn pre_deserialize(&mut self, _client: &mut Client, resp: &mut Response) {
+        // The bit vector length is derived from the statement's full column
+        // count. For a cached re-execute the metadata is already known; on the
+        // first execute it is set once describe info arrives (and again here
+        // would be empty, which the describe-info handler then corrects).
+        resp.set_num_columns(self.statement.out_metadata().len());
     }
 
     fn resend_needed(&self) -> bool {
