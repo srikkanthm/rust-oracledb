@@ -281,6 +281,14 @@ impl AuthMessage {
         plain.extend(std::iter::repeat_n(pad as u8, pad));
         let mut encrypted = vec![0u8; plain.len()];
         encrypt_cbc_128(&combo_key, &plain, &mut encrypted);
+        crate::advanced_nego::ano_trace(&format!(
+            "auth 10g: server_key_len={} client_key_len={} \
+             auth_sesskey_hex_len={} auth_password_hex_len={}",
+            server_key.len(),
+            client_key.len(),
+            client_key_enc.len() * 2,
+            encrypted.len() * 2
+        ));
         self.add_pair(
             "AUTH_PASSWORD",
             &base16ct::upper::encode_string(&encrypted),
@@ -556,6 +564,10 @@ impl Message for AuthMessage {
             if key == "AUTH_VFR_DATA" {
                 self.verifier_type = Some(flags);
             }
+            crate::advanced_nego::ano_trace(&format!(
+                "auth pair {key} value_len={} flags={flags:#010x}",
+                value.len()
+            ));
             self.session_data.insert(key, value);
         }
         crate::advanced_nego::ano_trace(&format!(
